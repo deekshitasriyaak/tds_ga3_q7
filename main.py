@@ -2,7 +2,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi
+from google import genai
+from google.genai import types
+import os
+import json
 import re
 
 app = FastAPI()
@@ -20,55 +23,12 @@ class AskRequest(BaseModel):
     topic: str
 
 
-def extract_video_id(url: str) -> str:
-    patterns = [
-        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
-        r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
-        r'(?:embed\/)([0-9A-Za-z_-]{11})',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    raise ValueError(f"Could not extract video ID from URL: {url}")
-
-
-def seconds_to_hhmmss(seconds: float) -> str:
-    seconds = int(seconds)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def get_transcript(video_id: str) -> list:
-    ytt = YouTubeTranscriptApi()
-    transcript = ytt.fetch(video_id)
-    return [{"start": entry.start, "text": entry.text} for entry in transcript]
-
-
-def find_timestamp_by_search(transcript: list, topic: str) -> str:
-    topic_lower = topic.lower()
-    topic_words = [w for w in topic_lower.split() if len(w) > 2]
-
-    # Try exact phrase match first
-    for entry in transcript:
-        if topic_lower in entry["text"].lower():
-            return seconds_to_hhmmss(entry["start"])
-
-    # Fall back to best keyword match
-    best_entry = None
-    best_score = 0
-    for entry in transcript:
-        text_lower = entry["text"].lower()
-        score = sum(1 for word in topic_words if word in text_lower)
-        if score > best_score:
-            best_score = score
-            best_entry = entry
-
-    if best_entry and best_score > 0:
-        return seconds_to_hhmmss(best_entry["start"])
-
+def normalize_timestamp(ts: str) -> str:
+    parts = ts.strip().split(":")
+    if len(parts) == 2:
+        return f"00:{parts[0].zfill(2)}:{parts[1].zfill(2)}"
+    elif len(parts) == 3:
+        return f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{parts[2].zfill(2)}"
     return "00:00:00"
 
 
@@ -78,9 +38,36 @@ async def ask(request: AskRequest):
         raise HTTPException(status_code=422, detail="video_url and topic are required")
 
     try:
-        video_id = extract_video_id(request.video_url)
-        transcript = get_transcript(video_id)
-        timestamp = find_timestamp_by_search(transcript, request.topic)
+        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+
+        prompt = f"""You are analyzing a YouTube video.
+Video URL: {request.video_url}
+
+Find the FIRST timestamp in the video where the topic "{request.topic}" is spoken or discussed.
+
+Return ONLY a JSON object with the timestamp in HH:MM:SS format.
+Example: {{"timestamp": "00:05:47"}}"""
+
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "timestamp": types.Schema(
+                            type=types.Type.STRING,
+                            description="Timestamp in HH:MM:SS format"
+                        )
+                    },
+                    required=["timestamp"]
+                )
+            )
+        )
+
+        result = json.loads(response.text)
+        timestamp = normalize_timestamp(result.get("timestamp", "00:00:00"))
 
         return JSONResponse(content={
             "timestamp": timestamp,
