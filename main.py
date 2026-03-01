@@ -7,7 +7,6 @@ import os
 import json
 import re
 import urllib.request
-import urllib.parse
 
 app = FastAPI()
 
@@ -29,19 +28,6 @@ class AskRequest(BaseModel):
     topic: str
 
 
-def extract_video_id(url: str) -> str:
-    patterns = [
-        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
-        r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
-        r'(?:embed\/)([0-9A-Za-z_-]{11})',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    raise ValueError(f"Could not extract video ID from URL: {url}")
-
-
 def seconds_to_hhmmss(seconds: float) -> str:
     seconds = int(seconds)
     h = seconds // 3600
@@ -51,22 +37,13 @@ def seconds_to_hhmmss(seconds: float) -> str:
 
 
 def get_transcript_via_apify(video_url: str) -> list:
-    """Use Apify to fetch YouTube transcript bypassing IP blocks."""
     apify_token = os.environ.get("APIFY_TOKEN")
+    url = f"https://api.apify.com/v2/acts/scrapio~youtube-transcript-scraper/run-sync-get-dataset-items?token={apify_token}&timeout=60"
 
-    # Start the Apify actor run
-    actor_url = f"https://api.apify.com/v2/acts/topaz~youtube-transcript-scraper/run-sync-get-dataset-items?token={apify_token}&timeout=60"
-
-    payload = json.dumps({
-        "urls": [video_url],
-        "outputFormat": "captions",
-        "maxRetries": 3,
-        "channelHandleBoolean": False,
-        "channelNameBoolean": False,
-    }).encode("utf-8")
+    payload = json.dumps({"url": video_url}).encode("utf-8")
 
     req = urllib.request.Request(
-        actor_url,
+        url,
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST"
@@ -78,9 +55,26 @@ def get_transcript_via_apify(video_url: str) -> list:
     if not result or len(result) == 0:
         raise ValueError("No transcript returned from Apify")
 
-    # Extract captions with timestamps
-    captions = result[0].get("captions", [])
-    return [{"start": c.get("start", 0), "text": c.get("text", "")} for c in captions]
+    # Try different output formats from this actor
+    item = result[0]
+
+    # Format 1: captions array with start/text
+    if "captions" in item:
+        captions = item["captions"]
+        return [{"start": c.get("start", 0), "text": c.get("text", "")} for c in captions]
+
+    # Format 2: transcript array
+    if "transcript" in item:
+        transcript = item["transcript"]
+        if isinstance(transcript, list):
+            return [{"start": c.get("start", c.get("offset", 0)), "text": c.get("text", "")} for c in transcript]
+
+    # Format 3: plain text — split into chunks
+    if "transcriptText" in item or "text" in item:
+        text = item.get("transcriptText") or item.get("text", "")
+        return [{"start": 0, "text": text}]
+
+    raise ValueError(f"Unknown transcript format. Keys: {list(item.keys())}")
 
 
 def find_timestamp_with_groq(transcript: list, topic: str) -> str:
