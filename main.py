@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from youtube_transcript_api import YouTubeTranscriptApi
 import re
 
 app = FastAPI()
@@ -41,43 +42,33 @@ def seconds_to_hhmmss(seconds: float) -> str:
 
 
 def get_transcript(video_id: str) -> list:
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-        ytt = YouTubeTranscriptApi()
-        transcript = ytt.fetch(video_id)
-        return [{"start": entry.start, "text": entry.text} for entry in transcript]
-    except Exception:
-        from youtube_transcript_api import YouTubeTranscriptApi
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        return transcript
+    ytt = YouTubeTranscriptApi()
+    transcript = ytt.fetch(video_id)
+    return [{"start": entry.start, "text": entry.text} for entry in transcript]
 
 
 def find_timestamp_by_search(transcript: list, topic: str) -> str:
-    """Find timestamp by searching transcript text for topic keywords."""
     topic_lower = topic.lower()
     topic_words = [w for w in topic_lower.split() if len(w) > 2]
 
+    # Try exact phrase match first
+    for entry in transcript:
+        if topic_lower in entry["text"].lower():
+            return seconds_to_hhmmss(entry["start"])
+
+    # Fall back to best keyword match
     best_entry = None
     best_score = 0
-
     for entry in transcript:
         text_lower = entry["text"].lower()
-        # Count how many topic words appear in this line
         score = sum(1 for word in topic_words if word in text_lower)
         if score > best_score:
             best_score = score
             best_entry = entry
 
-    # Also try exact phrase match
-    for entry in transcript:
-        text_lower = entry["text"].lower()
-        if topic_lower in text_lower:
-            return seconds_to_hhmmss(entry["start"])
-
     if best_entry and best_score > 0:
         return seconds_to_hhmmss(best_entry["start"])
 
-    # Default to beginning if not found
     return "00:00:00"
 
 
