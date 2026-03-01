@@ -2,11 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import os
-import json
 import re
-from google import genai
-from google.genai import types
 
 app = FastAPI()
 
@@ -46,64 +42,43 @@ def seconds_to_hhmmss(seconds: float) -> str:
 
 def get_transcript(video_id: str) -> list:
     try:
-        # Try new API style first
         from youtube_transcript_api import YouTubeTranscriptApi
         ytt = YouTubeTranscriptApi()
         transcript = ytt.fetch(video_id)
         return [{"start": entry.start, "text": entry.text} for entry in transcript]
     except Exception:
-        # Fall back to old API style
         from youtube_transcript_api import YouTubeTranscriptApi
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
         return transcript
 
 
-def find_timestamp_with_gemini(transcript: list, topic: str) -> str:
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+def find_timestamp_by_search(transcript: list, topic: str) -> str:
+    """Find timestamp by searching transcript text for topic keywords."""
+    topic_lower = topic.lower()
+    topic_words = [w for w in topic_lower.split() if len(w) > 2]
 
-    transcript_text = "\n".join([
-        f"[{seconds_to_hhmmss(entry['start'])}] {entry['text']}"
-        for entry in transcript
-    ])
+    best_entry = None
+    best_score = 0
 
-    prompt = f"""You are given a YouTube video transcript with timestamps in [HH:MM:SS] format.
-Find the FIRST timestamp where the topic "{topic}" is spoken or discussed.
+    for entry in transcript:
+        text_lower = entry["text"].lower()
+        # Count how many topic words appear in this line
+        score = sum(1 for word in topic_words if word in text_lower)
+        if score > best_score:
+            best_score = score
+            best_entry = entry
 
-TRANSCRIPT:
-{transcript_text[:15000]}
+    # Also try exact phrase match
+    for entry in transcript:
+        text_lower = entry["text"].lower()
+        if topic_lower in text_lower:
+            return seconds_to_hhmmss(entry["start"])
 
-Return the exact timestamp from the transcript where "{topic}" first appears."""
+    if best_entry and best_score > 0:
+        return seconds_to_hhmmss(best_entry["start"])
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "timestamp": types.Schema(
-                        type=types.Type.STRING,
-                        description="Timestamp in HH:MM:SS format e.g. 00:05:47"
-                    )
-                },
-                required=["timestamp"]
-            )
-        )
-    )
-
-    result = json.loads(response.text)
-    ts = result.get("timestamp", "00:00:00").strip()
-
-    parts = ts.split(":")
-    if len(parts) == 2:
-        ts = f"00:{parts[0].zfill(2)}:{parts[1].zfill(2)}"
-    elif len(parts) == 3:
-        ts = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{parts[2].zfill(2)}"
-    else:
-        ts = "00:00:00"
-
-    return ts
+    # Default to beginning if not found
+    return "00:00:00"
 
 
 @app.post("/ask")
@@ -114,7 +89,7 @@ async def ask(request: AskRequest):
     try:
         video_id = extract_video_id(request.video_url)
         transcript = get_transcript(video_id)
-        timestamp = find_timestamp_with_gemini(transcript, request.topic)
+        timestamp = find_timestamp_by_search(transcript, request.topic)
 
         return JSONResponse(content={
             "timestamp": timestamp,
