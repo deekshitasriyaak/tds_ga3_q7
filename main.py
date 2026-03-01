@@ -49,7 +49,7 @@ Return ONLY a JSON object with the timestamp in HH:MM:SS format.
 Example: {{"timestamp": "00:05:47"}}"""
 
         response = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-1.5-flash-latest",
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
