@@ -1,4 +1,5 @@
 fastapi
 uvicorn
 pydantic
-google-genai
+openai
+youtube-transcript-api
