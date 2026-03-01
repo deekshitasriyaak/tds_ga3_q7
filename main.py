@@ -5,7 +5,6 @@ from pydantic import BaseModel
 import os
 import json
 import re
-from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
 from google.genai import types
 
@@ -25,7 +24,6 @@ class AskRequest(BaseModel):
 
 
 def extract_video_id(url: str) -> str:
-    """Extract YouTube video ID from various URL formats."""
     patterns = [
         r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
         r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
@@ -39,7 +37,6 @@ def extract_video_id(url: str) -> str:
 
 
 def seconds_to_hhmmss(seconds: float) -> str:
-    """Convert seconds to HH:MM:SS format."""
     seconds = int(seconds)
     h = seconds // 3600
     m = (seconds % 3600) // 60
@@ -48,23 +45,28 @@ def seconds_to_hhmmss(seconds: float) -> str:
 
 
 def get_transcript(video_id: str) -> list:
-    """Fetch transcript from YouTube."""
-    transcript = YouTubeTranscriptApi.get_transcript(video_id)
-    return transcript
+    try:
+        # Try new API style first
+        from youtube_transcript_api import YouTubeTranscriptApi
+        ytt = YouTubeTranscriptApi()
+        transcript = ytt.fetch(video_id)
+        return [{"start": entry.start, "text": entry.text} for entry in transcript]
+    except Exception:
+        # Fall back to old API style
+        from youtube_transcript_api import YouTubeTranscriptApi
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        return transcript
 
 
 def find_timestamp_with_gemini(transcript: list, topic: str) -> str:
-    """Use Gemini to find when a topic is mentioned in the transcript."""
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-    # Format transcript as text with timestamps
     transcript_text = "\n".join([
         f"[{seconds_to_hhmmss(entry['start'])}] {entry['text']}"
         for entry in transcript
     ])
 
     prompt = f"""You are given a YouTube video transcript with timestamps in [HH:MM:SS] format.
-
 Find the FIRST timestamp where the topic "{topic}" is spoken or discussed.
 
 TRANSCRIPT:
@@ -93,7 +95,6 @@ Return the exact timestamp from the transcript where "{topic}" first appears."""
     result = json.loads(response.text)
     ts = result.get("timestamp", "00:00:00").strip()
 
-    # Ensure HH:MM:SS format
     parts = ts.split(":")
     if len(parts) == 2:
         ts = f"00:{parts[0].zfill(2)}:{parts[1].zfill(2)}"
@@ -111,13 +112,8 @@ async def ask(request: AskRequest):
         raise HTTPException(status_code=422, detail="video_url and topic are required")
 
     try:
-        # Step 1: Extract video ID
         video_id = extract_video_id(request.video_url)
-
-        # Step 2: Get transcript (no download needed!)
         transcript = get_transcript(video_id)
-
-        # Step 3: Ask Gemini to find the timestamp
         timestamp = find_timestamp_with_gemini(transcript, request.topic)
 
         return JSONResponse(content={
