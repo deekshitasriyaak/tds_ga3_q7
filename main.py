@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from openai import OpenAI
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import WebshareProxyConfig
 import os
 import json
 import re
@@ -49,18 +51,28 @@ def seconds_to_hhmmss(seconds: float) -> str:
 
 
 def get_transcript(video_id: str) -> list:
-    from youtube_transcript_api import YouTubeTranscriptApi
-    ytt = YouTubeTranscriptApi()
+    proxy_user = os.environ.get("WEBSHARE_USER")
+    proxy_pass = os.environ.get("WEBSHARE_PASS")
+
+    if proxy_user and proxy_pass:
+        ytt = YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=proxy_user,
+                proxy_password=proxy_pass,
+            )
+        )
+    else:
+        ytt = YouTubeTranscriptApi()
+
     transcript = ytt.fetch(video_id)
     return [{"start": entry.start, "text": entry.text} for entry in transcript]
 
 
 def find_timestamp_with_groq(transcript: list, topic: str) -> str:
-    # Format transcript with timestamps
     transcript_text = "\n".join([
         f"[{seconds_to_hhmmss(entry['start'])}] {entry['text']}"
         for entry in transcript
-    ])[:12000]  # Stay within token limits
+    ])[:12000]
 
     response = client.chat.completions.create(
         model="llama-3.1-8b-instant",
@@ -86,7 +98,6 @@ def find_timestamp_with_groq(transcript: list, topic: str) -> str:
     result = json.loads(response.choices[0].message.content)
     ts = result.get("timestamp", "00:00:00").strip()
 
-    # Ensure HH:MM:SS format
     parts = ts.split(":")
     if len(parts) == 2:
         ts = f"00:{parts[0].zfill(2)}:{parts[1].zfill(2)}"
