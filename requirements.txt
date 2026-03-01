@@ -2,4 +2,4 @@ fastapi
 uvicorn
 pydantic
 google-genai
-yt-dlp
+youtube-transcript-api

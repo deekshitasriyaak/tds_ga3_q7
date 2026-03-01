@@ -3,10 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
+import json
 import re
-import time
-import tempfile
-import subprocess
+from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
 from google.genai import types
 
@@ -25,56 +24,57 @@ class AskRequest(BaseModel):
     topic: str
 
 
-def download_audio(video_url: str, output_path: str) -> str:
-    """Download audio-only using yt-dlp."""
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "-x",                          # extract audio only
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "-o", output_path,
-        video_url
+def extract_video_id(url: str) -> str:
+    """Extract YouTube video ID from various URL formats."""
+    patterns = [
+        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+        r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
+        r'(?:embed\/)([0-9A-Za-z_-]{11})',
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed: {result.stderr}")
-    return output_path
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    raise ValueError(f"Could not extract video ID from URL: {url}")
 
 
-def upload_and_wait(client: genai.Client, audio_path: str):
-    """Upload audio to Gemini Files API and wait for ACTIVE state."""
-    uploaded = client.files.upload(path=audio_path)
-    # Poll until ACTIVE
-    for _ in range(30):
-        file_info = client.files.get(name=uploaded.name)
-        if file_info.state.name == "ACTIVE":
-            return file_info
-        elif file_info.state.name == "FAILED":
-            raise RuntimeError("Gemini file processing failed")
-        time.sleep(3)
-    raise RuntimeError("Timeout waiting for file to become ACTIVE")
+def seconds_to_hhmmss(seconds: float) -> str:
+    """Convert seconds to HH:MM:SS format."""
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def ask_gemini_for_timestamp(client: genai.Client, audio_file, topic: str) -> str:
-    """Ask Gemini to find when a topic is spoken in the audio."""
-    prompt = f"""Listen to this audio carefully and find the FIRST moment where the topic "{topic}" is spoken or discussed.
+def get_transcript(video_id: str) -> list:
+    """Fetch transcript from YouTube."""
+    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+    return transcript
 
-Return ONLY the timestamp in HH:MM:SS format (e.g. "00:05:47").
-If you cannot find it, return the closest relevant moment.
-Return just the timestamp string, nothing else."""
+
+def find_timestamp_with_gemini(transcript: list, topic: str) -> str:
+    """Use Gemini to find when a topic is mentioned in the transcript."""
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+
+    # Format transcript as text with timestamps
+    transcript_text = "\n".join([
+        f"[{seconds_to_hhmmss(entry['start'])}] {entry['text']}"
+        for entry in transcript
+    ])
+
+    prompt = f"""You are given a YouTube video transcript with timestamps in [HH:MM:SS] format.
+
+Find the FIRST timestamp where the topic "{topic}" is spoken or discussed.
+
+TRANSCRIPT:
+{transcript_text[:15000]}
+
+Return the exact timestamp from the transcript where "{topic}" first appears."""
 
     response = client.models.generate_content(
         model="gemini-2.0-flash",
-        contents=[
-            types.Content(parts=[
-                types.Part(text=prompt),
-                types.Part(file_data=types.FileData(
-                    mime_type=audio_file.mime_type,
-                    file_uri=audio_file.uri
-                ))
-            ])
-        ],
+        contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=types.Schema(
@@ -82,7 +82,7 @@ Return just the timestamp string, nothing else."""
                 properties={
                     "timestamp": types.Schema(
                         type=types.Type.STRING,
-                        description="Timestamp in HH:MM:SS format"
+                        description="Timestamp in HH:MM:SS format e.g. 00:05:47"
                     )
                 },
                 required=["timestamp"]
@@ -90,12 +90,11 @@ Return just the timestamp string, nothing else."""
         )
     )
 
-    import json
     result = json.loads(response.text)
-    ts = result.get("timestamp", "00:00:00")
+    ts = result.get("timestamp", "00:00:00").strip()
 
     # Ensure HH:MM:SS format
-    parts = ts.strip().split(":")
+    parts = ts.split(":")
     if len(parts) == 2:
         ts = f"00:{parts[0].zfill(2)}:{parts[1].zfill(2)}"
     elif len(parts) == 3:
@@ -111,33 +110,21 @@ async def ask(request: AskRequest):
     if not request.video_url or not request.topic:
         raise HTTPException(status_code=422, detail="video_url and topic are required")
 
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    try:
+        # Step 1: Extract video ID
+        video_id = extract_video_id(request.video_url)
 
-    # Use temp file for audio
-    with tempfile.TemporaryDirectory() as tmpdir:
-        audio_path = os.path.join(tmpdir, "audio.mp3")
+        # Step 2: Get transcript (no download needed!)
+        transcript = get_transcript(video_id)
 
-        try:
-            # Step 1: Download audio
-            download_audio(request.video_url, audio_path)
+        # Step 3: Ask Gemini to find the timestamp
+        timestamp = find_timestamp_with_gemini(transcript, request.topic)
 
-            # Step 2: Upload to Gemini Files API
-            audio_file = upload_and_wait(client, audio_path)
+        return JSONResponse(content={
+            "timestamp": timestamp,
+            "video_url": request.video_url,
+            "topic": request.topic
+        })
 
-            # Step 3: Ask Gemini for timestamp
-            timestamp = ask_gemini_for_timestamp(client, audio_file, request.topic)
-
-            # Step 4: Clean up uploaded file
-            try:
-                client.files.delete(name=audio_file.name)
-            except Exception:
-                pass
-
-            return JSONResponse(content={
-                "timestamp": timestamp,
-                "video_url": request.video_url,
-                "topic": request.topic
-            })
-
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
