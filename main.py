@@ -3,11 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from openai import OpenAI
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.proxies import WebshareProxyConfig
 import os
 import json
 import re
+import urllib.request
+import urllib.parse
 
 app = FastAPI()
 
@@ -19,7 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = OpenAI(
+groq_client = OpenAI(
     api_key=os.environ.get("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1"
 )
@@ -50,22 +50,37 @@ def seconds_to_hhmmss(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def get_transcript(video_id: str) -> list:
-    proxy_user = os.environ.get("WEBSHARE_USER")
-    proxy_pass = os.environ.get("WEBSHARE_PASS")
+def get_transcript_via_apify(video_url: str) -> list:
+    """Use Apify to fetch YouTube transcript bypassing IP blocks."""
+    apify_token = os.environ.get("APIFY_TOKEN")
 
-    if proxy_user and proxy_pass:
-        ytt = YouTubeTranscriptApi(
-            proxy_config=WebshareProxyConfig(
-                proxy_username=proxy_user,
-                proxy_password=proxy_pass,
-            )
-        )
-    else:
-        ytt = YouTubeTranscriptApi()
+    # Start the Apify actor run
+    actor_url = f"https://api.apify.com/v2/acts/topaz~youtube-transcript-scraper/run-sync-get-dataset-items?token={apify_token}&timeout=60"
 
-    transcript = ytt.fetch(video_id)
-    return [{"start": entry.start, "text": entry.text} for entry in transcript]
+    payload = json.dumps({
+        "urls": [video_url],
+        "outputFormat": "captions",
+        "maxRetries": 3,
+        "channelHandleBoolean": False,
+        "channelNameBoolean": False,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        actor_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    with urllib.request.urlopen(req, timeout=90) as response:
+        result = json.loads(response.read().decode())
+
+    if not result or len(result) == 0:
+        raise ValueError("No transcript returned from Apify")
+
+    # Extract captions with timestamps
+    captions = result[0].get("captions", [])
+    return [{"start": c.get("start", 0), "text": c.get("text", "")} for c in captions]
 
 
 def find_timestamp_with_groq(transcript: list, topic: str) -> str:
@@ -74,7 +89,7 @@ def find_timestamp_with_groq(transcript: list, topic: str) -> str:
         for entry in transcript
     ])[:12000]
 
-    response = client.chat.completions.create(
+    response = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[
             {
@@ -115,8 +130,7 @@ async def ask(request: AskRequest):
         raise HTTPException(status_code=422, detail="video_url and topic are required")
 
     try:
-        video_id = extract_video_id(request.video_url)
-        transcript = get_transcript(video_id)
+        transcript = get_transcript_via_apify(request.video_url)
         timestamp = find_timestamp_with_groq(transcript, request.topic)
 
         return JSONResponse(content={
